@@ -20,7 +20,7 @@ We provide a custom marketplace for all the online streaming extensions hosted i
 3. Click on "**Change repository**".
 4. Under the marketplace URLs, add the following URL:
    ```text
-   https://raw.githubusercontent.com/TropicalFrog3/seanime-extension/refs/heads/main/TropicalFrog%27s-marketplace/main.json
+   https://raw.githubusercontent.com/kiraitachi/seanime-extension/refs/heads/main/kiraitachi%27s-marketplace/main.json
    ```
 5. You will immediately see all the available extensions from this repository, ready to install with a single click!
 
