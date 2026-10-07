@@ -95,17 +95,22 @@ class Provider {
      * response) gets in the way. `mustContain` lets callers declare that a page is
      * only considered valid if it holds specific content (e.g. an .m3u8 URL).
      */
-    private async getHtml(url: string, opts?: { mustContain?: RegExp; browserWaitMs?: number }): Promise<string> {
+    private async getHtml(
+        url: string,
+        opts?: { mustContain?: RegExp; browserWaitMs?: number; forceBrowser?: boolean },
+    ): Promise<string> {
         let html = "";
-        try {
-            const res = await fetch(url, { headers: this.baseHeaders });
-            if (res.ok) html = await res.text();
-        } catch (_) {
-            // fall through to browser
-        }
+        if (!opts?.forceBrowser) {
+            try {
+                const res = await fetch(url, { headers: this.baseHeaders });
+                if (res.ok) html = await res.text();
+            } catch (_) {
+                // fall through to browser
+            }
 
-        const invalid = isChallengePage(html) || (opts?.mustContain ? !opts.mustContain.test(html) : false);
-        if (!invalid) return html;
+            const invalid = isChallengePage(html) || (opts?.mustContain ? !opts.mustContain.test(html) : false);
+            if (!invalid) return html;
+        }
 
         console.log(`Falling back to ChromeDP for ${url}`);
         let browser: any;
@@ -194,34 +199,36 @@ class Provider {
         const enc = encodeURIComponent(query);
         console.log(`Searching for: "${query}"`);
 
-        // The old `/?s=` endpoint is gone (it now just returns the homepage). The new
-        // endpoint is not confirmed, so try likely candidates and validate the results.
-        // Once you confirm the real one in DevTools, keep only that URL here.
-        const candidates = [
-            `${this.BASE_URL}/search?q=${enc}`,
-            `${this.BASE_URL}/search/?q=${enc}`,
-            `${this.BASE_URL}/watch/?q=${enc}`,
-            `${this.BASE_URL}/watch/?search=${enc}`,
-            `${this.BASE_URL}/?q=${enc}`,
-        ];
+        // The old `/?s=` endpoint is gone. Current search endpoint (confirmed from the site UI):
+        //   https://hentaihaven.xxx/search/?q=<query>
+        const searchUrl = `${this.BASE_URL}/search/?q=${enc}`;
+        console.log(`Search URL: ${searchUrl}`);
 
         const found = new Map<string, SearchResult>();
 
-        for (const url of candidates) {
-            try {
-                const res = await fetch(url, { headers: this.baseHeaders });
-                if (!res.ok) continue;
+        // 1) Plain fetch (server-rendered results)
+        try {
+            const res = await fetch(searchUrl, { headers: this.baseHeaders });
+            if (res.ok) {
                 const html = await res.text();
-                if (isChallengePage(html)) continue;
-
-                const relevant = this.filterRelevant(await this.parseTitleLinks(html), query);
-                if (relevant.length > 0) {
-                    console.log(`Search endpoint worked: ${url} (${relevant.length} results)`);
-                    relevant.forEach((r) => found.set(r.id, r));
-                    break;
+                if (!isChallengePage(html)) {
+                    this.filterRelevant(await this.parseTitleLinks(html), query).forEach((r) =>
+                        found.set(r.id, r),
+                    );
                 }
-            } catch (_) {
-                // try next candidate
+            }
+        } catch (_) { }
+
+        // 2) Real browser (Cloudflare, or results rendered client-side by JS)
+        if (found.size === 0) {
+            const html = await this.getHtml(searchUrl, {
+                forceBrowser: true,
+                browserWaitMs: 5000,
+            });
+            if (html) {
+                this.filterRelevant(await this.parseTitleLinks(html), query).forEach((r) =>
+                    found.set(r.id, r),
+                );
             }
         }
 
