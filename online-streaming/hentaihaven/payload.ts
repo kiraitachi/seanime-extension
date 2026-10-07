@@ -1,21 +1,19 @@
 /// <reference path="../_external/.onlinestream-provider.d.ts" />
 /// <reference path="../_external/core.d.ts" />
 
-// ---------- Types ----------
-type HentaiHavenSearchResult = {
-    title: string;
-    slug: string;
-    url: string;
-}
+// ---------- Constants ----------
+const UA =
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
-type HentaiHavenEpisode = {
-    number: number;
-    title: string;
-    url: string;
-    slug: string;
-}
-
-
+const SUBTITLE_LANGS: Record<string, string> = {
+    en: "English", es: "Spanish", de: "German", fr: "French",
+    id: "Indonesian", pl: "Polish", pt: "Portuguese", tr: "Turkish",
+    ru: "Russian", it: "Italian", ar: "Arabic", nl: "Dutch",
+    zh: "Chinese", ko: "Korean", ja: "Japanese", hu: "Hungarian",
+    cs: "Czech", vi: "Vietnamese", ro: "Romanian", sv: "Swedish",
+    th: "Thai", da: "Danish", he: "Hebrew", el: "Greek",
+    fi: "Finnish", uk: "Ukrainian",
+};
 
 // ---------- Utility Functions ----------
 function cleanTitle(title: string): string {
@@ -26,37 +24,54 @@ function cleanTitle(title: string): string {
 }
 
 function extractSlugFromUrl(url: string): string {
-    const match = url.match(/\/watch\/([^\/]+)/);
+    const match = url.match(/\/watch\/([^\/?#]+)/);
     return match ? match[1] : "";
 }
 
-function rot13(str: string): string {
-    const i = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz".split("");
-    const e = "NOPQRSTUVWXYZABCDEFGHIJKLMnopqrstuvwxyzabcdefghijklm".split("");
-    const t = i.reduce((acc, char, idx) => Object.assign(acc, { [char]: e[idx] }), {} as any);
-    return str.split("").map(n => t[n] || n).join("");
+function slugify(text: string): string {
+    return text
+        .toLowerCase()
+        .replace(/&/g, " ")
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/^-+|-+$/g, "");
 }
 
-function decodeToken(token: string): any {
-    try {
-        // The token has a "sha512-" prefix that needs to be removed
-        let e = token.replace("sha512-", "");
-        // The token is decoded 3 times using ROT13 and Base64 in that specific order
-        for (let i = 0; i < 3; i++) {
-            e = rot13(e);
-            e = Buffer.from(e, 'base64').toString('utf8');
-        }
-        return JSON.parse(e);
-    } catch (e) {
-        console.log("Error decoding token:", e);
-        return null;
-    }
+function normalizeText(text: string): string {
+    return text.toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+// Titles on listing pages come with rating/views glued on, e.g. "Harem Camp! 4.0 12.7M"
+function stripListingNoise(title: string): string {
+    return title
+        .replace(/\s+/g, " ")
+        .replace(/\s+\d(\.\d)?\s+(Uncensored\s+)?[\d.]+[KM]?$/i, "")
+        .replace(/\s*-?\s*Episode\s*\d+\s*$/i, "")
+        .trim();
+}
+
+function isChallengePage(html: string): boolean {
+    return (
+        !html ||
+        html.length < 3000 ||
+        html.includes("cf-challenge") ||
+        html.includes("Checking your browser") ||
+        html.includes("Just a moment...")
+    );
+}
+
+function absoluteUrl(base: string, href: string): string {
+    if (href.startsWith("http")) return href;
+    if (href.startsWith("//")) return "https:" + href;
+    return base + (href.startsWith("/") ? "" : "/") + href;
+}
+
+function stripQueryAndHash(url: string): string {
+    return url.split("#")[0].split("?")[0];
 }
 
 // ---------- Main Class ----------
 class Provider {
     private readonly BASE_URL = "https://hentaihaven.xxx";
-    private readonly SEARCH_URL = `${this.BASE_URL}/`;
 
     getSettings(): Settings {
         return {
@@ -65,147 +80,228 @@ class Provider {
         };
     }
 
-    async search(opts: SearchOptions): Promise<SearchResult[]> {
-        let query = cleanTitle(opts.query);
+    // ----- Networking helpers -----
 
-        console.log(`Searching for: "${query}"`);
+    private get baseHeaders(): Record<string, string> {
+        return {
+            "User-Agent": UA,
+            "Referer": `${this.BASE_URL}/`,
+            "Origin": this.BASE_URL,
+        };
+    }
 
-        const searchUrl = `${this.SEARCH_URL}?s=${encodeURIComponent(query)}`;
-        console.log(`Search URL: ${searchUrl}`);
-
+    /**
+     * Plain fetch first; falls back to a real browser if Cloudflare (or an empty
+     * response) gets in the way. `mustContain` lets callers declare that a page is
+     * only considered valid if it holds specific content (e.g. an .m3u8 URL).
+     */
+    private async getHtml(url: string, opts?: { mustContain?: RegExp; browserWaitMs?: number }): Promise<string> {
         let html = "";
         try {
-            const response = await fetch(searchUrl);
-            if (response.ok) {
-                html = await response.text();
+            const res = await fetch(url, { headers: this.baseHeaders });
+            if (res.ok) html = await res.text();
+        } catch (_) {
+            // fall through to browser
+        }
+
+        const invalid = isChallengePage(html) || (opts?.mustContain ? !opts.mustContain.test(html) : false);
+        if (!invalid) return html;
+
+        console.log(`Falling back to ChromeDP for ${url}`);
+        let browser: any;
+        try {
+            browser = await ChromeDP.newBrowser({ timeout: 45000 });
+            await browser.navigate(url);
+
+            // Wait out a Cloudflare interstitial if there is one
+            for (let i = 0; i < 10; i++) {
+                const title = await browser.evaluate("document.title");
+                if (title && title !== "Just a moment...") break;
+                await browser.sleep(2500);
             }
+            await browser.sleep(opts?.browserWaitMs ?? 3000);
+            html = await browser.evaluate("document.documentElement.outerHTML");
         } catch (e) {
-            console.log("Fetch failed, likely Cloudflare challenge");
-        }
-
-        // If fetch failed or returned a challenge page (often identified by length or specific content)
-        if (!html || html.length < 5000 || html.includes("cf-challenge") || html.includes("Checking your browser")) {
-            console.log("Cloudflare detected or fetch failed, using ChromeDP for search");
-            try {
-                const browser = await ChromeDP.newBrowser({ timeout: 30000 });
-                await browser.navigate(searchUrl);
-                await browser.sleep(8000); // Wait for challenge
-                html = await browser.evaluate("document.documentElement.outerHTML");
-                await browser.close();
-            } catch (e) {
-                console.log(`ChromeDP search failed: ${e}`);
-                return [];
+            console.log(`ChromeDP failed for ${url}: ${e}`);
+        } finally {
+            if (browser) {
+                try { await browser.close(); } catch (_) { }
             }
         }
+        return html || "";
+    }
 
+    // ----- Search -----
+
+    /** Pull every /watch/<slug>/ title link out of a page (excludes episode pages). */
+    private async parseTitleLinks(html: string): Promise<SearchResult[]> {
         const $ = await LoadDoc(html);
-        const results: SearchResult[] = [];
-        const seenUrls = new Set<string>();
+        const bySlug = new Map<string, SearchResult>();
 
-        // Try multiple selectors to find content
-        const selectors = [
-            ".c-tabs-item",
-            ".in-grid",
-            "div[class*='grid']",
-            "a[href*='/watch/']",
-            ".item-summary",
-            ".related-reading-wrap",
-            ".popular-item-wrap",
-            ".col-md-zarat",
-            ".c-page__content"
+        const anchors = $("a[href*='/watch/']");
+        anchors.each((_, el) => {
+            const href = el.attr("href") || "";
+            if (!href || href.includes("/episode-")) return;
+
+            const fullUrl = stripQueryAndHash(absoluteUrl(this.BASE_URL, href));
+            const slug = extractSlugFromUrl(fullUrl);
+            if (!slug) return;
+
+            // Prefer an explicit title/alt, otherwise anchor text with the noise stripped
+            let rawTitle = el.attr("title") || "";
+            if (!rawTitle) {
+                const img = el.find("img");
+                if (img.length() > 0) rawTitle = img.attr("alt") || "";
+            }
+            if (!rawTitle) rawTitle = el.text().trim();
+
+            const title = stripListingNoise(rawTitle);
+            if (!title) return;
+
+            // The listing renders two anchors per card (image + text); keep the shortest clean one
+            const existing = bySlug.get(slug);
+            if (!existing || title.length < existing.title.length) {
+                bySlug.set(slug, {
+                    id: slug,
+                    title,
+                    url: fullUrl.endsWith("/") ? fullUrl : fullUrl + "/",
+                    subOrDub: "sub",
+                });
+            }
+        });
+
+        return Array.from(bySlug.values());
+    }
+
+    /** Keep only results that plausibly match the query (guards against homepage junk). */
+    private filterRelevant(results: SearchResult[], query: string): SearchResult[] {
+        const tokens = query
+            .toLowerCase()
+            .split(/[^a-z0-9]+/)
+            .filter((t) => t.length >= 3);
+        if (tokens.length === 0) return results;
+
+        const needed = Math.ceil(tokens.length / 2);
+        return results.filter((r) => {
+            const hay = normalizeText(r.title + " " + r.id);
+            const hits = tokens.filter((t) => hay.includes(t)).length;
+            return hits >= needed;
+        });
+    }
+
+    async search(opts: SearchOptions): Promise<SearchResult[]> {
+        const query = cleanTitle(opts.query);
+        const enc = encodeURIComponent(query);
+        console.log(`Searching for: "${query}"`);
+
+        // The old `/?s=` endpoint is gone (it now just returns the homepage). The new
+        // endpoint is not confirmed, so try likely candidates and validate the results.
+        // Once you confirm the real one in DevTools, keep only that URL here.
+        const candidates = [
+            `${this.BASE_URL}/search?q=${enc}`,
+            `${this.BASE_URL}/search/?q=${enc}`,
+            `${this.BASE_URL}/watch/?q=${enc}`,
+            `${this.BASE_URL}/watch/?search=${enc}`,
+            `${this.BASE_URL}/?q=${enc}`,
         ];
 
-        for (const selector of selectors) {
-            const entries = $(selector);
-            if (entries.length() > 0) {
-                entries.each((_, el) => {
-                    let title = "";
-                    let href = "";
+        const found = new Map<string, SearchResult>();
 
-                    if (el.attr("href")) {
-                        href = el.attr("href") || "";
-                        title = el.text().trim() || el.attr("title") || "";
-                    } else {
-                        const linkEl = el.find("a[href*='/watch/']");
-                        if (linkEl.length() > 0) {
-                            href = linkEl.attr("href") || "";
-                            title = linkEl.text().trim() || linkEl.attr("title") || "";
-                        }
-                    }
+        for (const url of candidates) {
+            try {
+                const res = await fetch(url, { headers: this.baseHeaders });
+                if (!res.ok) continue;
+                const html = await res.text();
+                if (isChallengePage(html)) continue;
 
-                    if (href && href.includes("/watch/") && !href.includes("/episode-")) {
-                        const fullUrl = href.startsWith("http") ? href : `${this.BASE_URL}${href}`;
-                        const slug = extractSlugFromUrl(fullUrl);
-
-                        if (slug && !seenUrls.has(fullUrl)) {
-                            seenUrls.add(fullUrl);
-                            const cleanedTitle = title.replace(/\s*-?\s*Episode\s*\d+/i, "").trim();
-                            if (cleanedTitle) {
-                                results.push({
-                                    id: slug,
-                                    title: cleanedTitle,
-                                    url: fullUrl,
-                                    subOrDub: "sub",
-                                });
-                            }
-                        }
-                    }
-                });
-                if (results.length > 0) break;
+                const relevant = this.filterRelevant(await this.parseTitleLinks(html), query);
+                if (relevant.length > 0) {
+                    console.log(`Search endpoint worked: ${url} (${relevant.length} results)`);
+                    relevant.forEach((r) => found.set(r.id, r));
+                    break;
+                }
+            } catch (_) {
+                // try next candidate
             }
         }
 
+        // Fallback 1: direct slug guess (titles map cleanly onto slugs on this site)
+        if (found.size === 0) {
+            const guess = slugify(query);
+            if (guess) {
+                try {
+                    const url = `${this.BASE_URL}/watch/${guess}/`;
+                    const res = await fetch(url, { headers: this.baseHeaders });
+                    if (res.ok) {
+                        const html = await res.text();
+                        if (!isChallengePage(html) && /\/watch\/[^"']+\/episode-\d+/.test(html)) {
+                            found.set(guess, { id: guess, title: query, url, subOrDub: "sub" });
+                            console.log(`Slug guess hit: ${guess}`);
+                        }
+                    }
+                } catch (_) { }
+            }
+        }
+
+        // Fallback 2: scan catalogue listing pages and filter locally
+        if (found.size === 0) {
+            const listings = [
+                `${this.BASE_URL}/watch/?sort=latest`,
+                `${this.BASE_URL}/watch/?sort=latest&page=2`,
+                `${this.BASE_URL}/watch/?sort=latest&page=3`,
+                `${this.BASE_URL}/browse/trending/`,
+                `${this.BASE_URL}/`,
+            ];
+            for (const url of listings) {
+                try {
+                    const res = await fetch(url, { headers: this.baseHeaders });
+                    if (!res.ok) continue;
+                    const html = await res.text();
+                    if (isChallengePage(html)) continue;
+                    this.filterRelevant(await this.parseTitleLinks(html), query).forEach((r) =>
+                        found.set(r.id, r),
+                    );
+                } catch (_) { }
+            }
+        }
+
+        const results = Array.from(found.values());
         console.log(`Found ${results.length} results`);
         return results;
     }
 
+    // ----- Episodes -----
+
     async findEpisodes(id: string): Promise<EpisodeDetails[]> {
-        const url = `${this.BASE_URL}/watch/${id}`;
+        const url = `${this.BASE_URL}/watch/${id}/`;
         console.log(`Fetching episodes from: ${url}`);
 
-        let html = "";
-        try {
-            const response = await fetch(url);
-            if (response.ok) {
-                html = await response.text();
-            }
-        } catch (e) { }
-
-        if (!html || html.length < 5000 || html.includes("cf-challenge")) {
-            console.log("Using ChromeDP for episodes");
-            const browser = await ChromeDP.newBrowser({ timeout: 30000 });
-            await browser.navigate(url);
-            await browser.sleep(5000);
-            html = await browser.evaluate("document.documentElement.outerHTML");
-            await browser.close();
-        }
+        const episodeHrefRe = new RegExp(`/watch/${id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/episode-\\d+`);
+        const html = await this.getHtml(url, { mustContain: episodeHrefRe });
 
         const $ = await LoadDoc(html);
         const episodes: EpisodeDetails[] = [];
-        const seenEpisodes = new Set<string>();
+        const seen = new Set<string>();
 
-        const episodeLinks = $("a[href*='/episode-'], option[data-redirect*='/episode-']");
-        episodeLinks.each((_, el) => {
-            const href = el.attr("href") || el.attr("data-redirect");
-            let text = el.text().trim();
+        $(`a[href*='/watch/${id}/episode-']`).each((_, el) => {
+            const href = el.attr("href");
+            if (!href) return;
 
-            if (href && !seenEpisodes.has(href)) {
-                seenEpisodes.add(href);
-                const episodeMatch = href.match(/episode-(\d+)/i) || text.match(/episode\s*(\d+)/i);
-                const episodeNum = episodeMatch ? parseInt(episodeMatch[1], 10) : episodes.length + 1;
+            const fullUrl = stripQueryAndHash(absoluteUrl(this.BASE_URL, href));
+            const normalized = fullUrl.endsWith("/") ? fullUrl : fullUrl + "/";
+            if (seen.has(normalized)) return;
 
-                const fullUrl = href.startsWith("http") ? href : `${this.BASE_URL}${href}`;
-                const episodeSlug = href.split("/").filter(Boolean).pop() || "";
+            const numMatch = normalized.match(/episode-(\d+)/i);
+            if (!numMatch) return;
+            seen.add(normalized);
 
-                if (fullUrl.includes(id)) {
-                    episodes.push({
-                        id: episodeSlug,
-                        number: episodeNum,
-                        url: fullUrl,
-                        title: text || `Episode ${episodeNum}`,
-                    });
-                }
-            }
+            const number = parseInt(numMatch[1], 10);
+            episodes.push({
+                id: `${id}/episode-${number}`,
+                number,
+                url: normalized,
+                title: `Episode ${number}`,
+            });
         });
 
         episodes.sort((a, b) => a.number - b.number);
@@ -213,214 +309,92 @@ class Provider {
         return episodes;
     }
 
+    // ----- Video sources -----
+
+    private async findSubtitles(playlistUrl: string): Promise<VideoSubtitle[]> {
+        const idMatch = playlistUrl.match(/octopusmanifest\.org\/([0-9a-f-]{36})\//i);
+        if (!idMatch) return [];
+
+        const manifestId = idMatch[1];
+        const subs: VideoSubtitle[] = [];
+
+        await Promise.all(
+            Object.entries(SUBTITLE_LANGS).map(async ([code, name]) => {
+                for (const ext of ["vtt", "ass"]) {
+                    try {
+                        const subUrl = `https://octopusmanifest.org/${manifestId}/s/${code}.${ext}`;
+                        const res = await fetch(subUrl, { method: "HEAD", headers: this.baseHeaders });
+                        if (res.ok) {
+                            subs.push({
+                                id: code,
+                                url: subUrl,
+                                language: name,
+                                isDefault: code === "en",
+                            });
+                            return; // prefer VTT, only fall back to ASS if VTT is missing
+                        }
+                    } catch (_) { }
+                }
+            }),
+        );
+
+        // Put English first so players pick it by default
+        subs.sort((a, b) => (a.id === "en" ? -1 : b.id === "en" ? 1 : a.language.localeCompare(b.language)));
+        console.log(`Found ${subs.length} subtitles for ${manifestId}`);
+        return subs;
+    }
+
+    private extractPlaylistUrls(html: string): string[] {
+        // The URL can be escaped inside script/JSON payloads (\u002F or \/)
+        const normalized = html.replace(/\\u002F/gi, "/").replace(/\\\//g, "/");
+        const urls = new Set<string>();
+
+        for (const m of normalized.matchAll(/https?:\/\/[^"'\s<>\\]+?\.m3u8[^"'\s<>\\]*/gi)) {
+            urls.add(m[0].replace(/&amp;/g, "&"));
+        }
+        return Array.from(urls);
+    }
+
     async findEpisodeServer(episode: EpisodeDetails, server: string): Promise<EpisodeServer> {
+        const headers = this.baseHeaders;
+
         if (!server || server !== "HentaiHaven") {
             return { server: "", headers: {}, videoSources: [] };
         }
 
         console.log(`Fetching video sources for episode: ${episode.url}`);
 
-        let videoSources: VideoSource[] = [];
-        let subs: VideoSubtitle[] = [];
-        let browser: any;
+        const videoSources: VideoSource[] = [];
+
         try {
-            // 1. Try to get everything via fetch first (it often bypasses Turnstile better than headless)
-            let playerUrl = "";
-            let token = "";
+            // The episode page now embeds the HLS playlist directly (no iframe/token/api.php).
+            const html = await this.getHtml(episode.url, { mustContain: /\.m3u8/i });
+            const playlists = this.extractPlaylistUrls(html);
 
-            console.log("Attempting extraction via fetch...");
-            const response = await fetch(episode.url);
-            if (response.ok) {
-                const html = await response.text();
-                const iframeMatch = html.match(/<iframe[^>]+src=["']([^"']+)["']/i);
-                if (iframeMatch) {
-                    playerUrl = iframeMatch[1];
-                    if (playerUrl.startsWith("//")) playerUrl = "https:" + playerUrl;
-                    console.log(`Found player URL: ${playerUrl}`);
-
-                    const playerResponse = await fetch(playerUrl, {
-                        headers: { "Referer": episode.url }
-                    });
-                    if (playerResponse.ok) {
-                        const playerHtml = await playerResponse.text();
-                        const metaRegex = /<meta[^>]+name=["']x-secure-token["'][^>]+content=["']([^"']+)["']/i;
-                        const tokenMatch = playerHtml.match(metaRegex);
-                        if (tokenMatch) {
-                            token = tokenMatch[1];
-                            console.log("Token extracted via fetch");
-                        }
-                    }
-                }
-
-                // verifify if theres subs
-                // response
-                /* 
-                NO SUBTITLE: <div id="subtitle-wrapper" class="control-btn" style="display: none;">
-                SUBTITLE:    <div id="subtitle-wrapper" class="control-btn" style="display: flex;">
-                */
-                // const subtitleWrapper = html.match(/<div[^>]+id="subtitle-wrapper"[^>]*>.*?<\/div>/i);
-                // if (subtitleWrapper) {
-                //     if (!subtitleWrapper?.[1]?.includes("none")) {
-                //         HaveSubs = true;
-                //     }
-                // }
+            if (playlists.length === 0) {
+                console.log("No .m3u8 found in episode page");
             }
 
-            // 2. If fetch failed, fallback to ChromeDP
-            if (!token) {
-                console.log("Fetch failed or no token, falling back to ChromeDP...");
-                browser = await ChromeDP.newBrowser({ timeout: 60000 });
-                await browser.navigate(episode.url);
+            let subtitles: VideoSubtitle[] | null = null;
+            for (const url of playlists) {
+                if (subtitles === null) subtitles = await this.findSubtitles(url);
 
-                let retries = 0;
-                while (retries < 15) {
-                    const title = await browser.evaluate("document.title");
-                    if (title && title !== "Just a moment...") break;
-                    await browser.sleep(3000);
-                    retries++;
-                }
-
-                const pageData = await browser.evaluate(`
-                    (() => {
-                        const iframe = document.querySelector('iframe[src*="player.php"]') || 
-                                     Array.from(document.querySelectorAll('iframe')).find(i => i.src.includes('player-logic'));
-                        let token = null;
-                        if (iframe) {
-                            try {
-                                token = iframe.contentWindow.document.querySelector('meta[name="x-secure-token"]')?.content;
-                            } catch (e) {}
-                        }
-                        return { playerUrl: iframe?.src, token: token };
-                    })()
-                `);
-                playerUrl = playerUrl || pageData?.playerUrl;
-                token = pageData?.token;
-
-                if (playerUrl && !token) {
-                    if (playerUrl.startsWith("//")) playerUrl = "https:" + playerUrl;
-                    await browser.navigate(playerUrl);
-                    await browser.sleep(5000);
-                    token = await browser.evaluate("document.querySelector('meta[name=\"x-secure-token\"]')?.content");
-                }
-            }
-
-            if (token) {
-                const config = decodeToken(token);
-                if (config && config.en && config.iv && config.uri) {
-                    let baseUri = config.uri;
-                    if (baseUri.startsWith("//")) baseUri = "https:" + baseUri;
-                    else if (!baseUri.startsWith("http")) baseUri = this.BASE_URL + (baseUri.startsWith("/") ? "" : "/") + baseUri;
-
-                    const apiUrl = baseUri.endsWith("/") ? `${baseUri}api.php` : `${baseUri}/api.php`;
-                    console.log(`Calling API: ${apiUrl}`);
-
-                    const bodyString = `action=zarat_get_data_player_ajax&a=${encodeURIComponent(config.en)}&b=${encodeURIComponent(config.iv)}`;
-
-                    const apiResponse = await fetch(apiUrl, {
-                        method: "POST",
-                        body: bodyString,
-                        headers: {
-                            "Content-Type": "application/x-www-form-urlencoded",
-                            "Referer": playerUrl || episode.url,
-                            "Origin": "https://hentaihaven.xxx",
-                            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-                        }
-                    }).then(res => res.json()).catch(e => ({ status: false, error: e.message }));
-
-                    if (apiResponse && apiResponse.status && apiResponse.data && apiResponse.data.sources) {
-                        for (const source of apiResponse.data.sources) {
-                            const idMatch = source.src.match(/octopusmanifest\.org\/([^\/]+)/);
-                            const currentSubId = source.id || apiResponse.data.id || (idMatch ? idMatch[1] : undefined);
-
-                            if (currentSubId != undefined && subs.length === 0) {
-                                // get subs if exist
-                                //https://octopusmanifest.org/aad59e72-ead1-4e3f-8cf3-6ac881217430/s/fr.ass
-                                const LANGUAGE_NAMES: Record<string, string> = {
-                                    en: 'English', es: 'Spanish', de: 'German', fr: 'French',
-                                    id: 'Indonesian', pl: 'Polish', pt: 'Portuguese', tr: 'Turkish',
-                                    ru: 'Russian', it: 'Italian', ar: 'Arabic', nl: 'Dutch',
-                                    zh: 'Chinese', ko: 'Korean', ja: 'Japanese', hu: 'Hungarian',
-                                    cs: 'Czech', vi: 'Vietnamese', ro: 'Romanian', sv: 'Swedish',
-                                    th: 'Thai', da: 'Danish', he: 'Hebrew', el: 'Greek',
-                                    fi: 'Finnish', uk: 'Ukrainian'
-                                };
-
-                                const subtitlePromises = Object.entries(LANGUAGE_NAMES).map(async ([code, name]) => {
-                                    try {
-                                        const baseUrl = `https://octopusmanifest.org/${currentSubId}/s/${code}`;
-
-                                        // 1. Try VTT first (hosted on manifest server)
-                                        const vttUrl = `${baseUrl}.vtt`;
-                                        const vttRes = await fetch(vttUrl, { method: "HEAD", timeout: 5 });
-
-                                        if (vttRes.ok) {
-                                            subs.push({
-                                                id: code,
-                                                url: vttUrl,
-                                                language: name,
-                                                isDefault: code === "en"
-                                            });
-                                        } else {
-                                            // 2. Fallback to ASS
-                                            const assUrl = `${baseUrl}.ass`;
-                                            const assRes = await fetch(assUrl, { method: "HEAD", timeout: 5 });
-                                            if (assRes.ok) {
-                                                subs.push({
-                                                    id: code,
-                                                    url: assUrl,
-                                                    language: name,
-                                                    isDefault: code === "en"
-                                                });
-                                            }
-                                        }
-                                    } catch (e) { }
-                                });
-                                await Promise.all(subtitlePromises);
-                                console.log(`Found ${subs.length} subtitles for ID ${currentSubId}`);
-                            }
-
-                            videoSources.push({
-                                url: source.src,
-                                type: source.src.includes(".m3u8") ? "m3u8" : "mp4",
-                                quality: source.label || "auto",
-                                subtitles: [...subs]
-                            });
-                        }
-                        console.log(`Found ${videoSources.length} sources`);
-                    } else {
-                        console.log("API Error or No Sources:", JSON.stringify(apiResponse));
-                    }
-                }
-            }
-
-            // Final fallback to network inspection if needed and browser is open
-            if (videoSources.length === 0 && browser) {
-                const networkSources = await browser.evaluate(`
-                    performance.getEntries()
-                        .filter(e => e.entryType === 'resource' && (e.name.includes('.m3u8') || e.name.includes('.mp4')))
-                        .map(e => e.name)
-                `);
-                networkSources?.forEach((url: string) => {
-                    if (!videoSources.find(s => s.url === url)) {
-                        videoSources.push({ url, type: url.includes('.m3u8') ? 'm3u8' : 'mp4', quality: 'auto', subtitles: [] });
-                    }
+                videoSources.push({
+                    url,
+                    type: "m3u8",
+                    quality: "auto",
+                    subtitles: [...subtitles],
                 });
             }
+            console.log(`Found ${videoSources.length} sources`);
         } catch (e: any) {
-            console.log(`Error: ${e.message}`);
-        } finally {
-            if (browser) await browser.close();
+            console.log(`findEpisodeServer error: ${e?.message ?? e}`);
         }
 
         return {
             server: "HentaiHaven",
-            headers: {
-                "Referer": "https://hentaihaven.xxx/",
-                "Origin": "https://hentaihaven.xxx",
-                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            },
-            videoSources: videoSources,
+            headers,
+            videoSources,
         };
     }
 }
-
